@@ -31,6 +31,10 @@ const receiver = new ExpressReceiver({
   },
 });
 
+receiver.app.get("/health", (_req, res) => {
+  res.status(200).send("ok");
+});
+
 const app = new App({
   token: env.SLACK_BOT_TOKEN,
   receiver,
