@@ -400,11 +400,14 @@ app.event("message", async ({ event, client, context }) => {
     text_len: typeof e.text === "string" ? e.text.length : 0,
   });
 
-  // ✅ Critical: only handle normal user messages (no subtype)
-  if (e.subtype) {
+  if (
+    e.subtype &&
+    e.subtype !== "file_share"
+  ) {
     logInfo("slack.message.ignored_subtype", baseCtx);
     return;
   }
+
   if (!e.user) {
     logInfo("slack.message.ignored_no_user", baseCtx);
     return;
