@@ -1,7 +1,10 @@
+// src/index.ts
 import "dotenv/config";
 import SlackBolt from "@slack/bolt";
 import * as tencentcloud from "tencentcloud-sdk-nodejs-ocr";
 import { z } from "zod";
+
+/* ----------------------------- env + logger ----------------------------- */
 
 const envSchema = z.object({
   PORT: z.coerce.number().default(3000),
@@ -14,9 +17,35 @@ const envSchema = z.object({
   LLM_API_URL: z.string().min(1).default("https://api.qnaigc.com/v1/chat/completions"),
   LLM_MODEL: z.string().min(1).default("deepseek/deepseek-v3.2-251201"),
 });
+
 const env = envSchema.parse(process.env);
 
-// 用 ExpressReceiver 才能自定义 path (/slack/events /slack/commands /slack/interactivity)
+function log(level: "INFO" | "WARN" | "ERROR", msg: string, extra: Record<string, any> = {}) {
+  const payload = {
+    ts: new Date().toISOString(),
+    level,
+    msg,
+    ...extra,
+  };
+  if (level === "ERROR") console.error(JSON.stringify(payload));
+  else if (level === "WARN") console.warn(JSON.stringify(payload));
+  else console.log(JSON.stringify(payload));
+}
+
+const logInfo = (msg: string, extra: Record<string, any> = {}) => log("INFO", msg, extra);
+const logWarn = (msg: string, extra: Record<string, any> = {}) => log("WARN", msg, extra);
+const logError = (msg: string, extra: Record<string, any> = {}) => log("ERROR", msg, extra);
+
+process.on("unhandledRejection", (reason: any) => {
+  logError("process.unhandledRejection", { reason: String(reason), stack: reason?.stack });
+});
+process.on("uncaughtException", (err: any) => {
+  logError("process.uncaughtException", { message: err?.message, stack: err?.stack });
+});
+
+/* ------------------------------ Slack Bolt ------------------------------ */
+
+// Use ExpressReceiver for custom endpoints (/slack/events /slack/commands /slack/interactivity)
 const { App, ExpressReceiver } = SlackBolt as typeof SlackBolt & {
   App: typeof SlackBolt.App;
   ExpressReceiver: typeof SlackBolt.ExpressReceiver;
@@ -40,6 +69,8 @@ const app = new App({
   receiver,
 });
 
+/* ------------------------------ Tencent OCR ----------------------------- */
+
 const OcrClient = tencentcloud.ocr.v20181119.Client;
 const ocrClient = new OcrClient({
   credential: {
@@ -47,39 +78,103 @@ const ocrClient = new OcrClient({
     secretKey: env.TENCENTCLOUD_SECRET_KEY,
   },
   region: env.TENCENTCLOUD_REGION,
-  profile: { httpProfile: { endpoint: "ocr.tencentcloudapi.com" } },
+  profile: {
+    httpProfile: {
+      endpoint: "ocr.tencentcloudapi.com",
+      // Optional: set request timeout for the SDK if supported by your version
+      // reqTimeout: 10, // seconds (some SDK versions support this)
+    },
+  },
 });
 
-async function fetchSlackFileAsBase64(fileUrl: string): Promise<string> {
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isRetryableNetworkError(err: any) {
+  const msg = String(err?.message || "");
+  return (
+    msg.includes("EAI_AGAIN") ||
+    msg.includes("ENOTFOUND") ||
+    msg.includes("ETIMEDOUT") ||
+    msg.includes("ECONNRESET") ||
+    msg.includes("socket hang up")
+  );
+}
+
+async function fetchSlackFileAsBase64(fileUrl: string, ctx: Record<string, any>): Promise<string> {
+  const start = Date.now();
+  logInfo("slack.file.download.start", { ...ctx, fileUrl });
+
   const res = await fetch(fileUrl, {
     headers: {
       Authorization: `Bearer ${env.SLACK_BOT_TOKEN}`,
     },
   });
+
   if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    logError("slack.file.download.failed", {
+      ...ctx,
+      status: res.status,
+      ms: Date.now() - start,
+      body_preview: body.slice(0, 300),
+    });
     throw new Error(`Failed to download file: ${res.status}`);
   }
+
   const arrayBuffer = await res.arrayBuffer();
+  logInfo("slack.file.download.ok", { ...ctx, ms: Date.now() - start, bytes: arrayBuffer.byteLength });
   return Buffer.from(arrayBuffer).toString("base64");
 }
 
-async function callTencentOCRWithSDK(imageBase64: string): Promise<string> {
-  try {
-    const result = await ocrClient.GeneralAccurateOCR({ ImageBase64: imageBase64 });
-    const dets = (result.TextDetections || []) as Array<{ DetectedText?: string }>;
-    if (dets.length === 0) return "";
-    return dets
-      .map((x) => x.DetectedText)
-      .filter((x) => x && x.trim().length > 0)
-      .join("\n");
-  } catch (err) {
-    console.error("Tencent SDK Error:", err);
-    throw new Error(`OCR Failed: ${err instanceof Error ? err.message : String(err)}`);
+async function callTencentOCRWithSDK(imageBase64: string, ctx: Record<string, any>): Promise<string> {
+  const maxAttempts = 4;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const start = Date.now();
+    try {
+      logInfo("tencent.ocr.request.start", { ...ctx, attempt });
+
+      const result = await ocrClient.GeneralAccurateOCR({ ImageBase64: imageBase64 });
+
+      const detCount = (result.TextDetections || []).length;
+      logInfo("tencent.ocr.request.ok", { ...ctx, attempt, ms: Date.now() - start, detections: detCount });
+
+      const dets = (result.TextDetections || []) as Array<{ DetectedText?: string }>;
+      return dets
+        .map((x) => x.DetectedText)
+        .filter((x) => x && x.trim().length > 0)
+        .join("\n");
+    } catch (err: any) {
+      logError("tencent.ocr.request.failed", {
+        ...ctx,
+        attempt,
+        ms: Date.now() - start,
+        message: err?.message,
+        requestId: err?.requestId || "",
+        traceId: err?.traceId || "",
+      });
+
+      if (attempt < maxAttempts && isRetryableNetworkError(err)) {
+        const backoff = 300 * Math.pow(2, attempt - 1);
+        logWarn("tencent.ocr.request.retrying", { ...ctx, attempt, backoff_ms: backoff });
+        await sleep(backoff);
+        continue;
+      }
+
+      throw new Error(`OCR Failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
+
+  return "";
 }
+
+/* --------------------------------- LLM --------------------------------- */
 
 async function callLLMToAnalyze(
   ocrText: string,
+  ctx: Record<string, any>,
 ): Promise<{ text: string; usage?: { prompt_tokens: number; completion_tokens: number } }> {
   const today = new Date().toISOString().split("T")[0];
   const systemPrompt = `
@@ -88,7 +183,7 @@ You are an expert OCR Data Extraction Auditor. Your goal is to extract precise s
 **Current Server Date:** ${today} (YYYY-MM-DD)
 *Use this date to infer the year if missing, or to validate that the transaction date is not in the distant future.*
 
-**Critical Instruction: Chain-of-Thought Analysis**
+**Critical Instruction: Context Analysis**
 Before extracting the final data, you MUST perform a "Context Analysis" to resolve ambiguities.
 
 **Step 1: Infer Region & Country**
@@ -127,6 +222,9 @@ Output ONLY the final result in the following clean Markdown format (No JSON, No
 *Total*: [Currency] [Amount]
 `;
 
+  const start = Date.now();
+  logInfo("llm.analyze.request.start", { ...ctx, ocr_chars: ocrText.length });
+
   try {
     const res = await fetch(env.LLM_API_URL, {
       method: "POST",
@@ -148,30 +246,40 @@ Output ONLY the final result in the following clean Markdown format (No JSON, No
       }),
     });
 
-    const data = await res.json();
-    if (data.error) {
-      console.error("LLM API Error Details:", data.error);
-      throw new Error(data.error.message || "LLM API returned an error");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) {
+      logError("llm.analyze.request.failed", {
+        ...ctx,
+        ms: Date.now() - start,
+        status: res.status,
+        error: data?.error,
+      });
+      throw new Error(data?.error?.message || `LLM API error (status ${res.status})`);
     }
 
     const content = data.choices?.[0]?.message?.content;
     const usage = data.usage;
 
+    logInfo("llm.analyze.request.ok", { ...ctx, ms: Date.now() - start, usage });
+
     return {
       text: content || "⚠️ AI could not analyze the text.",
       usage,
     };
-  } catch (error) {
-    console.error("Call LLM Failed:", error);
+  } catch (error: any) {
+    logError("llm.analyze.request.exception", { ...ctx, ms: Date.now() - start, message: error?.message });
     return { text: `⚠️ AI Analysis Failed. Raw Text:\n${ocrText}` };
   }
 }
 
-async function callLLMToChat(userText: string): Promise<{ text: string }> {
+async function callLLMToChat(userText: string, ctx: Record<string, any>): Promise<{ text: string }> {
   const systemPrompt = `
 You are a helpful assistant. Reply in a conversational, friendly tone.
 Keep answers concise and ask a short follow-up question if it helps clarify the user's intent.
 `;
+
+  const start = Date.now();
+  logInfo("llm.chat.request.start", { ...ctx, user_chars: userText.length });
 
   try {
     const res = await fetch(env.LLM_API_URL, {
@@ -191,157 +299,216 @@ Keep answers concise and ask a short follow-up question if it helps clarify the 
       }),
     });
 
-    const data = await res.json();
-    if (data.error) {
-      console.error("LLM API Error Details:", data.error);
-      throw new Error(data.error.message || "LLM API returned an error");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) {
+      logError("llm.chat.request.failed", { ...ctx, ms: Date.now() - start, status: res.status, error: data?.error });
+      throw new Error(data?.error?.message || `LLM API error (status ${res.status})`);
     }
 
     const content = data.choices?.[0]?.message?.content;
+
+    logInfo("llm.chat.request.ok", { ...ctx, ms: Date.now() - start });
+
     return { text: content || "⚠️ I could not generate a reply." };
-  } catch (error) {
-    console.error("Call LLM Failed:", error);
+  } catch (error: any) {
+    logError("llm.chat.request.exception", { ...ctx, ms: Date.now() - start, message: error?.message });
     return { text: "⚠️ AI reply failed. Please try again." };
   }
 }
 
+/* ----------------------------- Slack send utils -------------------------- */
+
+async function postThreadOrChannel(
+  client: any,
+  args: { channel: string; thread_ts?: string; text: string },
+  ctx: Record<string, any>,
+) {
+  try {
+    return await client.chat.postMessage(args);
+  } catch (err: any) {
+    const slackErr = err?.data?.error || err?.message || String(err);
+    logWarn("slack.chat.postMessage.failed", {
+      ...ctx,
+      slack_error: slackErr,
+      channel: args.channel,
+      thread_ts: args.thread_ts,
+    });
+
+    // Fallback if thread reply is not allowed
+    if (slackErr === "cannot_reply_to_message" && args.thread_ts) {
+      logWarn("slack.chat.postMessage.fallback_to_channel", { ...ctx, channel: args.channel });
+      return await client.chat.postMessage({ channel: args.channel, text: args.text });
+    }
+
+    throw err;
+  }
+}
+
+/* -------------------------------- Handlers ------------------------------- */
+
 /**
  * 1) Slash command: /analyze
- * Slack 要求 3 秒内 ack，否则会重试。Bolt 的 ack() 就是为这个设计的。
+ * Slack requires ack within 3 seconds.
  */
-app.command("/analyze", async ({ ack, respond, command }) => {
-  await ack();
-  const text = (command.text || "").trim();
+app.command("/analyze", async ({ ack, respond, command, context }) => {
+  const ctx = { event_id: context?.eventId, team_id: context?.teamId, kind: "slash:/analyze" };
 
+  const t0 = Date.now();
+  await ack();
+  logInfo("slack.command.analyze.acked", { ...ctx, ack_ms: Date.now() - t0 });
+
+  const text = (command.text || "").trim();
   if (!text) {
-    await respond({
-      response_type: "ephemeral",
-      text: "Send `/analyze <text>` or upload an image and mention me.",
-    });
+    await respond({ response_type: "ephemeral", text: "Send `/analyze <text>` or upload an image and mention me." });
     return;
   }
 
-  await respond({
-    response_type: "ephemeral",
-    text: "🤖 Analyzing your text...",
-  });
+  await respond({ response_type: "ephemeral", text: "🤖 Analyzing your text..." });
 
   try {
-    const { text: structuredResult } = await callLLMToChat(text);
+    const { text: structuredResult } = await callLLMToChat(text, ctx);
     const MAX = 3500;
-    const finalMsg =
-      structuredResult.length > MAX ? `${structuredResult.slice(0, MAX)}...(truncated)` : structuredResult;
+    const finalMsg = structuredResult.length > MAX ? `${structuredResult.slice(0, MAX)}...(truncated)` : structuredResult;
 
-    await respond({
-      response_type: "ephemeral",
-      text: finalMsg,
-    });
-  } catch (err) {
-    await respond({
-      response_type: "ephemeral",
-      text: `❌ Error: ${err instanceof Error ? err.message : String(err)}`,
-    });
+    await respond({ response_type: "ephemeral", text: finalMsg });
+  } catch (err: any) {
+    logError("slack.command.analyze.failed", { ...ctx, message: err?.message });
+    await respond({ response_type: "ephemeral", text: `❌ Error: ${err instanceof Error ? err.message : String(err)}` });
   }
 });
 
 /**
- * 2) 监听频道消息：只做最小例子
- * 注意：要在 Slack 后台订阅 message.channels，并且 bot 要在频道里
+ * 2) Channel message listener
+ * Subscribe to message.channels and ensure bot is in the channel.
  */
-app.event("message", async ({ event, client }) => {
-  // @ts-ignore
+app.event("message", async ({ event, client, context }) => {
   const e = event as any;
 
-  // 忽略 bot 自己消息，避免自触发
-  if (e.subtype === "bot_message") return;
+  const baseCtx = {
+    event_id: context?.eventId,
+    team_id: context?.teamId,
+    kind: "event:message",
+    channel: e.channel,
+    user: e.user,
+    ts: e.ts,
+    subtype: e.subtype,
+  };
 
+  logInfo("slack.message.received", {
+    ...baseCtx,
+    has_files: Array.isArray(e.files) && e.files.length > 0,
+    text_len: typeof e.text === "string" ? e.text.length : 0,
+  });
+
+  // ✅ Critical: only handle normal user messages (no subtype)
+  if (e.subtype) {
+    logInfo("slack.message.ignored_subtype", baseCtx);
+    return;
+  }
+  if (!e.user) {
+    logInfo("slack.message.ignored_no_user", baseCtx);
+    return;
+  }
+  if (e.bot_id) {
+    logInfo("slack.message.ignored_bot_id", baseCtx);
+    return;
+  }
+
+  const threadTs = e.thread_ts ?? e.ts;
+
+  // Image OCR pipeline
   const files = Array.isArray(e.files) ? e.files : [];
-  const imageFile = files.find(
-    (f: any) => typeof f?.mimetype === "string" && f.mimetype.startsWith("image/"),
-  );
+  const imageFile = files.find((f: any) => typeof f?.mimetype === "string" && f.mimetype.startsWith("image/"));
 
   if (imageFile?.url_private_download) {
-    await client.chat.postMessage({
-      channel: e.channel,
-      thread_ts: e.ts,
-      text: "🔍 Processing your image with OCR...",
-    });
+    const ctx = { ...baseCtx, thread_ts: threadTs, file_id: imageFile.id, mimetype: imageFile.mimetype };
+
+    await postThreadOrChannel(
+      client,
+      { channel: e.channel, thread_ts: threadTs, text: "🔍 Processing your image with OCR..." },
+      ctx,
+    );
 
     try {
-      const imageBase64 = await fetchSlackFileAsBase64(imageFile.url_private_download);
-      const ocrRawText = await callTencentOCRWithSDK(imageBase64);
+      logInfo("pipeline.ocr.start", ctx);
+
+      const imageBase64 = await fetchSlackFileAsBase64(imageFile.url_private_download, ctx);
+      logInfo("pipeline.ocr.image_base64.ready", { ...ctx, b64_len: imageBase64.length });
+
+      const ocrRawText = await callTencentOCRWithSDK(imageBase64, ctx);
+      logInfo("pipeline.ocr.text.ready", { ...ctx, ocr_chars: ocrRawText.length });
 
       if (!ocrRawText) {
-        await client.chat.postMessage({
-          channel: e.channel,
-          thread_ts: e.ts,
-          text: "❌ No text detected in the image.",
-        });
+        await postThreadOrChannel(
+          client,
+          { channel: e.channel, thread_ts: threadTs, text: "❌ No text detected in the image." },
+          ctx,
+        );
         return;
       }
 
-      const { text: structuredResult } = await callLLMToAnalyze(ocrRawText);
+      const { text: structuredResult } = await callLLMToAnalyze(ocrRawText, ctx);
       const MAX = 3500;
-      const finalMsg =
-        structuredResult.length > MAX ? `${structuredResult.slice(0, MAX)}...(truncated)` : structuredResult;
+      const finalMsg = structuredResult.length > MAX ? `${structuredResult.slice(0, MAX)}...(truncated)` : structuredResult;
 
-      await client.chat.postMessage({
-        channel: e.channel,
-        thread_ts: e.ts,
-        text: finalMsg,
-      });
-    } catch (err) {
-      console.error("OCR/LLM Error:", err);
-      await client.chat.postMessage({
-        channel: e.channel,
-        thread_ts: e.ts,
-        text: `❌ Error: ${err instanceof Error ? err.message : String(err)}`,
-      });
+      await postThreadOrChannel(client, { channel: e.channel, thread_ts: threadTs, text: finalMsg }, ctx);
+
+      logInfo("pipeline.ocr.done", ctx);
+    } catch (err: any) {
+      logError("pipeline.ocr.failed", { ...ctx, message: err?.message, stack: err?.stack });
+      await postThreadOrChannel(
+        client,
+        { channel: e.channel, thread_ts: threadTs, text: `❌ Error: ${err instanceof Error ? err.message : String(err)}` },
+        ctx,
+      );
     }
-
     return;
   }
 
-  // 如果用户 @bot，用对话式 AI 回复
+  // Chat mode: if message mentions a user (<@...>), reply in thread
   if (typeof e.text === "string" && e.text.includes("<@")) {
     const cleanedText = e.text.replace(/<@[^>]+>/g, "").trim();
+    const ctx = { ...baseCtx, thread_ts: threadTs, mode: "mention_chat" };
 
     if (!cleanedText) {
-      await client.chat.postMessage({
-        channel: e.channel,
-        thread_ts: e.ts,
-        text: "Hi! Tell me what you need help with.",
-      });
+      await postThreadOrChannel(client, { channel: e.channel, thread_ts: threadTs, text: "Hi! Tell me what you need." }, ctx);
       return;
     }
 
-    await client.chat.postMessage({
-      channel: e.channel,
-      thread_ts: e.ts,
-      text: "🤖 Thinking...",
-    });
+    await postThreadOrChannel(client, { channel: e.channel, thread_ts: threadTs, text: "🤖 Thinking..." }, ctx);
 
     try {
-      const { text: reply } = await callLLMToChat(cleanedText);
+      const { text: reply } = await callLLMToChat(cleanedText, ctx);
       const MAX = 3500;
       const finalMsg = reply.length > MAX ? `${reply.slice(0, MAX)}...(truncated)` : reply;
-
-      await client.chat.postMessage({
-        channel: e.channel,
-        thread_ts: e.ts,
-        text: finalMsg,
-      });
-    } catch (err) {
-      await client.chat.postMessage({
-        channel: e.channel,
-        thread_ts: e.ts,
-        text: `❌ Error: ${err instanceof Error ? err.message : String(err)}`,
-      });
+      await postThreadOrChannel(client, { channel: e.channel, thread_ts: threadTs, text: finalMsg }, ctx);
+    } catch (err: any) {
+      logError("pipeline.chat.failed", { ...ctx, message: err?.message, stack: err?.stack });
+      await postThreadOrChannel(
+        client,
+        { channel: e.channel, thread_ts: threadTs, text: `❌ Error: ${err instanceof Error ? err.message : String(err)}` },
+        ctx,
+      );
     }
   }
 });
 
+/* --------------------------------- start -------------------------------- */
+
 (async () => {
+  logInfo("app.starting", { port: env.PORT, region: env.TENCENTCLOUD_REGION });
+
   await app.start(env.PORT);
+
+  logInfo("app.started", {
+    url: `http://localhost:${env.PORT}`,
+    endpoints: {
+      events: "/slack/events",
+      commands: "/slack/commands",
+      interactivity: "/slack/interactivity",
+      health: "/health",
+    },
+  });
+
   console.log(`⚡ Slack bot listening on http://localhost:${env.PORT}`);
 })();
